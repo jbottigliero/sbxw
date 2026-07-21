@@ -2,6 +2,14 @@
 name = "sbxw"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["Joe Bottigliero"]
+description = "A thin CLI wrapper around Docker Sandboxes (sbx) and git worktrees"
+readme = "README.md"
+homepage = "https://github.com/jbottigliero/sbxw"
+repository = "https://github.com/jbottigliero/sbxw"
+keywords = ["cli", "sbx", "git"]
+categories = ["command-line-utilities", "development-tools", "artificial-intelligence"]
 
 [dependencies]
 anyhow = "1"
