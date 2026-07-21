@@ -10,6 +10,10 @@ homepage = "https://github.com/jbottigliero/sbxw"
 repository = "https://github.com/jbottigliero/sbxw"
 keywords = ["cli", "sbx", "git"]
 categories = ["command-line-utilities", "development-tools", "artificial-intelligence"]
+include = [
+    "**/*.rs",
+    "Cargo.toml",
+]
 
 [dependencies]
 anyhow = "1"
