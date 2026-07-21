@@ -23,6 +23,9 @@ enum Command {
         /// Agent to provision the sandbox with (claude, codex, ...)
         #[arg(long, default_value = "claude")]
         agent: String,
+        /// Kit reference
+        #[arg(long = "kit", value_name = "REF")]
+        kits: Vec<String>,
     },
     /// Remove a worktree and its Docker Sandbox
     Rm {
@@ -45,7 +48,7 @@ fn main() -> Result<()> {
     let args = Cli::parse();
     match args.command {
         Command::Ls => cmd_ls(),
-        Command::Launch { name, agent } => cmd_launch(&name, &agent),
+        Command::Launch { name, agent, kits } => cmd_launch(&name, &agent, &kits),
         Command::Rm { name, delete_branch } => cmd_rm(&name, delete_branch),
         Command::Compare { branch, name } => cmd_compare(&branch, &name),
     }
@@ -209,7 +212,7 @@ fn sandbox_exists(name: &str) -> Result<bool> {
 // Commands
 // ---------------------------------------------------------------------------
 
-fn cmd_launch(name: &str, agent: &str) -> Result<()> {
+fn cmd_launch(name: &str, agent: &str, kits: &[String]) -> Result<()> {
     let root = repo_root()?;
     let wt_path = worktree_path(&root, name);
     let wt_path_str = wt_path
@@ -233,10 +236,24 @@ fn cmd_launch(name: &str, agent: &str) -> Result<()> {
         }
     }
 
-    // 2. Ensure the sandbox exists.
+    // 2. Ensure the sandbox exists. Kits can only be applied at creation, so a
+    //    fresh sandbox gets them via `sbx create --kit`; an existing one via
+    //    `sbx kit add` (below).
     if !had_sandbox {
         println!("Creating sandbox `{sbx}` ({agent})...");
-        run("sbx", &["create", agent, wt_path_str, "--name", &sbx])?;
+        let mut args = vec!["create", agent, wt_path_str, "--name", &sbx];
+        for kit in kits {
+            args.push("--kit");
+            args.push(kit);
+        }
+        run("sbx", &args)?;
+    } else {
+        // Existing sandbox: append each requested kit. `sbx kit add` recreates
+        // the sandbox container (preserving VM state, volumes, agent history).
+        for kit in kits {
+            println!("Adding kit `{kit}` to `{sbx}` (recreates the sandbox)...");
+            run("sbx", &["kit", "add", &sbx, kit])?;
+        }
     }
 
     if had_worktree && had_sandbox {

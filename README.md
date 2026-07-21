@@ -1,7 +1,6 @@
 # sbxw
 
-A thin wrapper around
-Docker's [Host worktree workflow](https://docs.docker.com/ai/sandboxes/workflows/#host-worktree).
+A thin wrapper around Docker's [Host worktree workflow](https://docs.docker.com/ai/sandboxes/workflows/#host-worktree).
 
 ## Typical Workflow
 
@@ -41,7 +40,7 @@ The `sbxw-` sandbox prefix is how `sbxw` recognizes the sandboxes it manages (vi
 
 ## Commands
 
-### `sbxw launch <name> [--agent claude]`
+### `sbxw launch <name> [--agent claude] [--kit <ref>]...`
 
 Create (or attach to) a worktree + sandbox pair named `<name>`
 
@@ -54,6 +53,17 @@ Create (or attach to) a worktree + sandbox pair named `<name>`
 `--agent` selects the agent the sandbox is provisioned with (`claude`, `codex`,
 `shell`, …); default `claude`. To attach to the _agent_ instead of a shell, run
 `sbx run --name sbxw-<name>` directly.
+
+`--kit <ref>` attaches a [Kit](https://docs.docker.com/ai/sandboxes/customize/kits/). `sbxw` routes kit application by
+lifecycle:
+
+- **New sandbox** → passed through as `sbx create … --kit <ref>`.
+- **Existing sandbox** → applied with `sbx kit add sbxw-<name> <ref>`, which **recreates
+  the sandbox container** (VM state, volumes, and agent history are preserved).
+
+```sh
+sbxw launch feature-x --kit ./mcp-postgres/ --kit ghcr.io/myorg/my-kit:1.0
+```
 
 ### `sbxw ls`
 
