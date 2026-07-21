@@ -35,12 +35,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         delete_branch: bool,
     },
-    /// Show the full git diff between a branch and a worktree's branch
+    /// Show the git diff between a base branch and a worktree's working tree
     Compare {
-        /// The base branch to compare against
-        branch: String,
         /// Name of the worktree to compare
         name: String,
+        /// The base branch to compare against (defaults to the current branch)
+        branch: Option<String>,
     },
 }
 
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         Command::Ls => cmd_ls(),
         Command::Launch { name, agent, kits } => cmd_launch(&name, &agent, &kits),
         Command::Rm { name, delete_branch } => cmd_rm(&name, delete_branch),
-        Command::Compare { branch, name } => cmd_compare(&branch, &name),
+        Command::Compare { name, branch } => cmd_compare(&name, branch.as_deref()),
     }
 }
 
@@ -343,19 +343,25 @@ fn cmd_rm(name: &str, delete_branch: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_compare(branch: &str, name: &str) -> Result<()> {
+fn cmd_compare(name: &str, branch: Option<&str>) -> Result<()> {
     let root = repo_root()?;
     if !worktree_exists(&root, name) {
         bail!("no worktree named `{name}` under .sbxw/worktrees");
     }
-    // Resolve the branch checked out in the worktree; fall back to the name itself.
-    let target = managed_worktrees(&root)?
-        .into_iter()
-        .find(|(n, _)| n == name)
-        .and_then(|(_, w)| w.branch)
-        .unwrap_or_else(|| name.to_string());
+    let wt_path = worktree_path(&root, name);
+    let wt_path_str = wt_path
+        .to_str()
+        .ok_or_else(|| anyhow!("worktree path is not valid utf-8"))?;
 
-    let code = run_interactive("git", &["diff", branch, &target])?;
+    // Base branch to compare against; default to the branch checked out here.
+    let branch = match branch {
+        Some(b) => b.to_string(),
+        None => current_branch()?,
+    };
+
+    // Diff the base branch against the worktree's working tree (so uncommitted
+    // changes show up too), running git from within the worktree.
+    let code = run_interactive("git", &["-C", wt_path_str, "diff", &branch])?;
     if code != 0 {
         std::process::exit(code);
     }
@@ -365,6 +371,19 @@ fn cmd_compare(branch: &str, name: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Small git helpers
 // ---------------------------------------------------------------------------
+
+/// The branch currently checked out in the invocation's working directory.
+fn current_branch() -> Result<String> {
+    let out = run("git", &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let branch = String::from_utf8(out.stdout)
+        .context("git output was not utf-8")?
+        .trim()
+        .to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        bail!("could not determine the current branch (detached HEAD?)");
+    }
+    Ok(branch)
+}
 
 fn branch_exists(name: &str) -> Result<bool> {
     let status = ProcCommand::new("git")
