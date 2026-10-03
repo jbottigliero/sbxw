@@ -3,7 +3,7 @@ use std::process::{Command as ProcCommand, Output, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -15,7 +15,11 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// List worktree + Docker Sandbox combinations managed by sbxw
-    Ls,
+    Ls {
+        /// Print machine-readable JSON instead of a table
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Create (or attach to) a worktree and Docker Sandbox
     Launch {
         /// Name of the worktree/sandbox combination (also the branch name)
@@ -26,6 +30,9 @@ enum Command {
         /// Kit reference
         #[arg(long = "kit", value_name = "REF")]
         kits: Vec<String>,
+        /// Ensure the worktree + sandbox exist, but don't attach a shell
+        #[arg(long, default_value_t = false)]
+        no_attach: bool,
     },
     /// Remove a worktree and its Docker Sandbox
     Rm {
@@ -47,8 +54,13 @@ enum Command {
 fn main() -> Result<()> {
     let args = Cli::parse();
     match args.command {
-        Command::Ls => cmd_ls(),
-        Command::Launch { name, agent, kits } => cmd_launch(&name, &agent, &kits),
+        Command::Ls { json } => cmd_ls(json),
+        Command::Launch {
+            name,
+            agent,
+            kits,
+            no_attach,
+        } => cmd_launch(&name, &agent, &kits, no_attach),
         Command::Rm { name, delete_branch } => cmd_rm(&name, delete_branch),
         Command::Compare { name, branch } => cmd_compare(&name, branch.as_deref()),
     }
@@ -212,7 +224,7 @@ fn sandbox_exists(name: &str) -> Result<bool> {
 // Commands
 // ---------------------------------------------------------------------------
 
-fn cmd_launch(name: &str, agent: &str, kits: &[String]) -> Result<()> {
+fn cmd_launch(name: &str, agent: &str, kits: &[String], no_attach: bool) -> Result<()> {
     let root = repo_root()?;
     let wt_path = worktree_path(&root, name);
     let wt_path_str = wt_path
@@ -260,6 +272,11 @@ fn cmd_launch(name: &str, agent: &str, kits: &[String]) -> Result<()> {
         println!("Attaching to existing `{name}`...");
     }
 
+    if no_attach {
+        println!("`{name}` ready (worktree + sandbox `{sbx}`).");
+        return Ok(());
+    }
+
     // 3. Open an interactive shell in the sandbox.
     println!("Opening shell in `{sbx}` (exit to return)...");
     let code = run_interactive("sbx", &["run", "--name", &sbx])?;
@@ -269,7 +286,17 @@ fn cmd_launch(name: &str, agent: &str, kits: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ls() -> Result<()> {
+#[derive(Debug, Serialize)]
+struct ComboJson {
+    name: String,
+    branch: Option<String>,
+    worktree_path: Option<String>,
+    worktree_status: &'static str,
+    sandbox_name: String,
+    sandbox_status: String,
+}
+
+fn cmd_ls(json: bool) -> Result<()> {
     let root = repo_root()?;
     let worktrees = managed_worktrees(&root)?;
     let sandboxes = list_sandboxes()?;
@@ -284,6 +311,29 @@ fn cmd_ls() -> Result<()> {
         }
     }
     names.sort();
+
+    if json {
+        let combos: Vec<ComboJson> = names
+            .into_iter()
+            .map(|name| {
+                let wt = worktrees.iter().find(|(n, _)| n == &name).map(|(_, w)| w);
+                let sandbox_status = sandboxes
+                    .iter()
+                    .find(|s| name_from_sandbox(&s.name) == Some(name.as_str()))
+                    .map(|s| s.status.clone());
+                ComboJson {
+                    branch: wt.and_then(|w| w.branch.clone()),
+                    worktree_path: wt.map(|w| w.path.display().to_string()),
+                    worktree_status: if wt.is_some() { "ok" } else { "missing" },
+                    sandbox_name: sandbox_name(&name),
+                    sandbox_status: sandbox_status.unwrap_or_else(|| "missing".to_string()),
+                    name,
+                }
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&combos)?);
+        return Ok(());
+    }
 
     if names.is_empty() {
         println!("No sbxw worktree/sandbox combinations found.");

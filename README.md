@@ -59,7 +59,12 @@ Run `sbxw --help` (or `sbxw <command> --help`) for exact usage and flags. At a g
 - **`launch` is idempotent.** A missing worktree is created (new branch `<name>` off
   `HEAD`, or an existing `<name>` branch checked out); a missing sandbox is created;
   if both exist, `sbxw` just attaches. It drops you into a shell — to attach to the
-  _agent_ instead, run `sbx run --name sbxw-<name>` directly.
+  _agent_ instead, run `sbx run --name sbxw-<name>` directly. Pass `--no-attach` to
+  stop after ensuring the worktree + sandbox exist, without opening a shell
+  (useful when driving `sbxw` from something other than an interactive terminal).
+- **`ls --json`** prints the same combos as the table, one object per combo
+  (`name`, `branch`, `worktree_path`, `worktree_status`, `sandbox_name`,
+  `sandbox_status`), for scripts and tools instead of eyeballing the table.
 - **`--kit` routing depends on lifecycle.** On a new sandbox, kits pass through to
   `sbx create … --kit`. On an existing one, each kit is applied with `sbx kit add`,
   which **recreates the sandbox container** (VM state, volumes, and agent history are
