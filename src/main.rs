@@ -107,14 +107,41 @@ fn run(cmd: &str, args: &[&str]) -> Result<Output> {
 /// Run a command inheriting the terminal (stdin/stdout/stderr) — for interactive
 /// shells and streamed diffs. Returns the child's exit code.
 fn run_interactive(cmd: &str, args: &[&str]) -> Result<i32> {
-    let status = ProcCommand::new(cmd)
+    run_interactive_env(cmd, args, &[])
+}
+
+/// Like `run_interactive`, but with extra environment variables set on the child.
+fn run_interactive_env(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> Result<i32> {
+    let mut command = ProcCommand::new(cmd);
+    command
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let status = command
         .status()
         .with_context(|| format!("failed to spawn `{cmd}`"))?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Like `run`, but with extra environment variables set on the child.
+fn run_env(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> Result<Output> {
+    let mut command = ProcCommand::new(cmd);
+    command.args(args);
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("failed to spawn `{cmd}`"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("`{cmd} {}` failed:\n{stderr}", args.join(" "));
+    }
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -359,9 +386,50 @@ fn cmd_compare(name: &str, branch: Option<&str>) -> Result<()> {
         None => current_branch()?,
     };
 
+    // `git diff <branch>` only reports paths git already knows about, so untracked
+    // files in the worktree would be invisible. Work against a throwaway copy of the
+    // worktree's index and mark untracked files intent-to-add there — they then show
+    // up in the diff as new files, without touching the real index.
+    let out = run(
+        "git",
+        &[
+            "-C",
+            wt_path_str,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        ],
+    )?;
+    let real_index = String::from_utf8(out.stdout)
+        .context("git output was not utf-8")?
+        .trim()
+        .to_string();
+
+    // Keep the temp index inside .git (next to the real one) so it never lands under
+    // the worktree tree and gets picked up by `git add`.
+    let tmp_index = format!("{real_index}.sbxw-compare");
+    if std::path::Path::new(&real_index).exists() {
+        std::fs::copy(&real_index, &tmp_index).context("failed to copy git index")?;
+    } else {
+        // No index yet (fresh worktree); make sure a stale temp index isn't reused.
+        let _ = std::fs::remove_file(&tmp_index);
+    }
+    let index_env = [("GIT_INDEX_FILE", tmp_index.as_str())];
+
+    // Intent-to-add untracked (non-ignored) files into the throwaway index.
+    run_env(
+        "git",
+        &["-C", wt_path_str, "add", "-N", "--", "."],
+        &index_env,
+    )?;
+
     // Diff the base branch against the worktree's working tree (so uncommitted
     // changes show up too), running git from within the worktree.
-    let code = run_interactive("git", &["-C", wt_path_str, "diff", &branch])?;
+    let code = run_interactive_env("git", &["-C", wt_path_str, "diff", &branch], &index_env)?;
+
+    let _ = std::fs::remove_file(&tmp_index);
+
     if code != 0 {
         std::process::exit(code);
     }
