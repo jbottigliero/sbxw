@@ -372,7 +372,15 @@ fn cmd_rm(name: &str, delete_branch: bool) -> Result<()> {
         println!("No sandbox `{sbx}`.");
     }
 
-    if worktree_exists(&root, name) {
+    // Check git's own worktree registration rather than just the directory:
+    // the directory may have been deleted without `git worktree remove`
+    // (e.g. manual `rm -rf`, a prior partial `rm`, or sandbox teardown),
+    // leaving a stale ("prunable") entry that still blocks `branch -D` with
+    // "used by worktree" even though nothing is on disk. `git worktree
+    // remove --force` clears that registration fine even when the
+    // directory is already gone, and only touches this one worktree.
+    let registered = managed_worktrees(&root)?.iter().any(|(n, _)| n == name);
+    if registered {
         let wt_path_str = wt_path
             .to_str()
             .ok_or_else(|| anyhow!("worktree path is not valid utf-8"))?;
