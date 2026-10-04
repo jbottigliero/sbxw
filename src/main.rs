@@ -172,10 +172,10 @@ fn managed_worktrees(root: &Path) -> Result<Vec<(String, Worktree)>> {
     let dir = worktrees_dir(root);
     let mut managed = Vec::new();
     for wt in list_worktrees()? {
-        if wt.path.parent() == Some(dir.as_path()) {
-            if let Some(name) = wt.path.file_name().and_then(|n| n.to_str()) {
-                managed.push((name.to_string(), wt));
-            }
+        if wt.path.parent() == Some(dir.as_path())
+            && let Some(name) = wt.path.file_name().and_then(|n| n.to_str())
+        {
+            managed.push((name.to_string(), wt));
         }
     }
     Ok(managed)
@@ -186,6 +186,8 @@ struct SbxEntry {
     name: String,
     #[serde(default)]
     status: String,
+    #[serde(default)]
+    workspaces: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,7 +196,9 @@ struct SbxList {
     sandboxes: Vec<SbxEntry>,
 }
 
-/// All `sbxw-`-prefixed sandboxes reported by `sbx ls --json`.
+/// All `sbxw-`-prefixed sandboxes reported by `sbx ls --json`, across every
+/// repo on the machine. Sandbox names are global, so this alone does not
+/// mean a given entry belongs to *this* repo — see `sandbox_belongs_to_repo`.
 fn list_sandboxes() -> Result<Vec<SbxEntry>> {
     let out = run("sbx", &["ls", "--json"])?;
     let text = String::from_utf8(out.stdout).context("sbx output was not utf-8")?;
@@ -215,9 +219,53 @@ fn worktree_exists(root: &Path, name: &str) -> bool {
     worktree_path(root, name).is_dir()
 }
 
-fn sandbox_exists(name: &str) -> Result<bool> {
+/// True if `workspace` (one of the paths `sbx ls --json` reports for a
+/// sandbox) is this repo's worktree directory for `name`, i.e.
+/// `<root>/.sbxw/worktrees/<name>`.
+///
+/// Canonicalizes both sides first so symlinks and macOS's `/private` prefix
+/// don't cause a false mismatch. If either side no longer exists on disk
+/// (e.g. the worktree was deleted but the sandbox lingers as an orphan),
+/// canonicalization fails and we fall back to comparing the raw paths —
+/// `sbx create` was given this exact path at creation time, so a lexical
+/// match is still meaningful.
+fn workspace_matches(root: &Path, name: &str, workspace: &str) -> bool {
+    let expected = worktree_path(root, name);
+    let workspace_path = Path::new(workspace);
+    match (expected.canonicalize(), workspace_path.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => expected == workspace_path,
+    }
+}
+
+/// True if any of `entry`'s workspaces is this repo's worktree directory for
+/// `name`.
+fn sandbox_belongs_to_repo(root: &Path, name: &str, entry: &SbxEntry) -> bool {
+    entry
+        .workspaces
+        .iter()
+        .any(|w| workspace_matches(root, name, w))
+}
+
+/// All `sbxw-`-prefixed sandboxes that actually belong to this repo (i.e. one
+/// of their workspaces is `<root>/.sbxw/worktrees/<name>`), keyed by the
+/// `<name>` recovered from the sandbox name.
+fn scoped_sandboxes(root: &Path) -> Result<Vec<SbxEntry>> {
+    Ok(list_sandboxes()?
+        .into_iter()
+        .filter(|s| {
+            name_from_sandbox(&s.name)
+                .is_some_and(|name| sandbox_belongs_to_repo(root, name, s))
+        })
+        .collect())
+}
+
+/// Looks up the sandbox named `sbxw-<name>` anywhere on the machine, not
+/// scoped to this repo — sandbox names are global, so this may return a
+/// sandbox that belongs to a different repo entirely.
+fn find_global_sandbox(name: &str) -> Result<Option<SbxEntry>> {
     let target = sandbox_name(name);
-    Ok(list_sandboxes()?.iter().any(|s| s.name == target))
+    Ok(list_sandboxes()?.into_iter().find(|s| s.name == target))
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +283,16 @@ fn cmd_launch(name: &str, agent: &str, kits: &[String], no_attach: bool) -> Resu
     std::fs::create_dir_all(worktrees_dir(&root)).context("failed to create .sbxw/worktrees")?;
 
     let had_worktree = worktree_exists(&root, name);
-    let had_sandbox = sandbox_exists(name)?;
+    let had_sandbox = match find_global_sandbox(name)? {
+        None => false,
+        Some(s) if sandbox_belongs_to_repo(&root, name, &s) => true,
+        Some(s) => bail!(
+            "sandbox `{sbx}` already exists but belongs to a different workspace ({}).\n\
+             Sandbox names are global, so `sbxw` can't attach to it from here. Remove it with \
+             `sbx rm -f {sbx}` if it's stale, or choose a different combo name.",
+            s.workspaces.join(", ")
+        ),
+    };
 
     // 1. Ensure the worktree exists.
     if !had_worktree {
@@ -294,20 +351,21 @@ struct ComboJson {
     worktree_status: &'static str,
     sandbox_name: String,
     sandbox_status: String,
+    sandbox_workspace: Option<String>,
 }
 
 fn cmd_ls(json: bool) -> Result<()> {
     let root = repo_root()?;
     let worktrees = managed_worktrees(&root)?;
-    let sandboxes = list_sandboxes()?;
+    let sandboxes = scoped_sandboxes(&root)?;
 
     // Union of names from both sides so orphans are visible.
     let mut names: Vec<String> = worktrees.iter().map(|(n, _)| n.clone()).collect();
     for s in &sandboxes {
-        if let Some(n) = name_from_sandbox(&s.name) {
-            if !names.iter().any(|x| x == n) {
-                names.push(n.to_string());
-            }
+        if let Some(n) = name_from_sandbox(&s.name)
+            && !names.iter().any(|x| x == n)
+        {
+            names.push(n.to_string());
         }
     }
     names.sort();
@@ -317,16 +375,18 @@ fn cmd_ls(json: bool) -> Result<()> {
             .into_iter()
             .map(|name| {
                 let wt = worktrees.iter().find(|(n, _)| n == &name).map(|(_, w)| w);
-                let sandbox_status = sandboxes
+                let sandbox = sandboxes
                     .iter()
-                    .find(|s| name_from_sandbox(&s.name) == Some(name.as_str()))
-                    .map(|s| s.status.clone());
+                    .find(|s| name_from_sandbox(&s.name) == Some(name.as_str()));
                 ComboJson {
                     branch: wt.and_then(|w| w.branch.clone()),
                     worktree_path: wt.map(|w| w.path.display().to_string()),
                     worktree_status: if wt.is_some() { "ok" } else { "missing" },
                     sandbox_name: sandbox_name(&name),
-                    sandbox_status: sandbox_status.unwrap_or_else(|| "missing".to_string()),
+                    sandbox_status: sandbox
+                        .map(|s| s.status.clone())
+                        .unwrap_or_else(|| "missing".to_string()),
+                    sandbox_workspace: sandbox.and_then(|s| s.workspaces.first().cloned()),
                     name,
                 }
             })
@@ -340,7 +400,7 @@ fn cmd_ls(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<20} {:<12} {}", "NAME", "BRANCH", "SANDBOX", "WORKTREE");
+    println!("{:<20} {:<20} {:<12} WORKTREE", "NAME", "BRANCH", "SANDBOX");
     for name in names {
         let wt = worktrees.iter().find(|(n, _)| n == &name).map(|(_, w)| w);
         let branch = wt
@@ -365,11 +425,20 @@ fn cmd_rm(name: &str, delete_branch: bool) -> Result<()> {
     let wt_path = worktree_path(&root, name);
     let sbx = sandbox_name(name);
 
-    if sandbox_exists(name)? {
-        println!("Removing sandbox `{sbx}`...");
-        run("sbx", &["rm", "-f", &sbx])?;
-    } else {
-        println!("No sandbox `{sbx}`.");
+    match find_global_sandbox(name)? {
+        Some(s) if sandbox_belongs_to_repo(&root, name, &s) => {
+            println!("Removing sandbox `{sbx}`...");
+            run("sbx", &["rm", "-f", &sbx])?;
+        }
+        Some(s) => {
+            println!(
+                "Sandbox `{sbx}` belongs to a different workspace ({}); leaving it alone.",
+                s.workspaces.join(", ")
+            );
+        }
+        None => {
+            println!("No sandbox `{sbx}`.");
+        }
     }
 
     // Check git's own worktree registration rather than just the directory:
@@ -454,4 +523,95 @@ fn branch_exists(name: &str) -> Result<bool> {
         .status()
         .context("failed to spawn `git show-ref`")?;
     Ok(status.success())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// A fresh, empty temp directory to use as a fake repo root, scoped to
+    /// the test name and process id so parallel test runs don't collide.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sbxw-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn matches_exact_worktree_path() {
+        let root = temp_dir("exact");
+        let wt = worktree_path(&root, "foo");
+        fs::create_dir_all(&wt).unwrap();
+
+        assert!(workspace_matches(&root, "foo", wt.to_str().unwrap()));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rejects_another_repos_worktree() {
+        let root_a = temp_dir("repo-a");
+        let root_b = temp_dir("repo-b");
+        let wt_a = worktree_path(&root_a, "foo");
+        fs::create_dir_all(&wt_a).unwrap();
+
+        // Same combo name, but root_b's own worktree for "foo" doesn't exist
+        // at all, let alone match root_a's.
+        assert!(!workspace_matches(&root_b, "foo", wt_a.to_str().unwrap()));
+
+        fs::remove_dir_all(&root_a).unwrap();
+        fs::remove_dir_all(&root_b).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_symlinks_via_canonicalize() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir("symlink-base");
+        let real_root = base.join("real-root");
+        fs::create_dir_all(&real_root).unwrap();
+        fs::create_dir_all(worktree_path(&real_root, "foo")).unwrap();
+
+        // The workspace sbx reports resolves to real_root's worktree through
+        // a symlink, mimicking macOS's /private prefix or a symlinked repo.
+        let linked_root = base.join("linked-root");
+        symlink(&real_root, &linked_root).unwrap();
+        let linked_workspace = worktree_path(&linked_root, "foo");
+
+        assert!(workspace_matches(
+            &real_root,
+            "foo",
+            linked_workspace.to_str().unwrap()
+        ));
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_lexical_match_when_worktree_is_gone() {
+        // Orphan case: the worktree directory was deleted, but the
+        // sandbox's reported workspace still points at where it used to be.
+        let root = temp_dir("orphan-match");
+        let wt = worktree_path(&root, "foo");
+
+        assert!(workspace_matches(&root, "foo", wt.to_str().unwrap()));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn fallback_still_rejects_an_unrelated_path() {
+        let root = temp_dir("orphan-mismatch");
+
+        assert!(!workspace_matches(&root, "foo", "/nonexistent/other/path"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

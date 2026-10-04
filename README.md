@@ -40,6 +40,12 @@ cargo install sbxw
 | Docker Sandbox     | `sbxw-<name>`                   |                                                     |
 
 The `sbxw-` sandbox prefix is how `sbxw` recognizes the sandboxes it manages (via `sbx ls --json`).
+Because Docker Sandbox names are global (not scoped to a repo), `sbxw` also checks each
+candidate sandbox's workspace against `<repo>/.sbxw/worktrees/<name>` before treating it as
+its own — so running `sbxw` in one repo never lists, removes, or attaches to a `sbxw-<name>`
+sandbox that belongs to a different repo. If a sandbox named `sbxw-<name>` already exists but
+belongs to a different repo's workspace, `sbxw launch <name>` fails with an error rather than
+attaching to it, since the name is already taken.
 
 This convention means that you can still use all `git worktree` and `sbx` commands directly, **neat**.
 
@@ -64,7 +70,7 @@ Run `sbxw --help` (or `sbxw <command> --help`) for exact usage and flags. At a g
   (useful when driving `sbxw` from something other than an interactive terminal).
 - **`ls --json`** prints the same combos as the table, one object per combo
   (`name`, `branch`, `worktree_path`, `worktree_status`, `sandbox_name`,
-  `sandbox_status`), for scripts and tools instead of eyeballing the table.
+  `sandbox_status`, `sandbox_workspace`), for scripts and tools instead of eyeballing the table.
 - **`--kit` routing depends on lifecycle.** On a new sandbox, kits pass through to
   `sbx create … --kit`. On an existing one, each kit is applied with `sbx kit add`,
   which **recreates the sandbox container** (VM state, volumes, and agent history are
