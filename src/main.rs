@@ -61,7 +61,10 @@ fn main() -> Result<()> {
             kits,
             no_attach,
         } => cmd_launch(&name, &agent, &kits, no_attach),
-        Command::Rm { name, delete_branch } => cmd_rm(&name, delete_branch),
+        Command::Rm {
+            name,
+            delete_branch,
+        } => cmd_rm(&name, delete_branch),
         Command::Compare { name, branch } => cmd_compare(&name, branch.as_deref()),
     }
 }
@@ -202,12 +205,24 @@ struct SbxList {
 fn list_sandboxes() -> Result<Vec<SbxEntry>> {
     let out = run("sbx", &["ls", "--json"])?;
     let text = String::from_utf8(out.stdout).context("sbx output was not utf-8")?;
-    // `sbx` may emit daemon-startup lines before the JSON; start at the first '{'.
+    parse_sbx_list(&text)
+}
+
+/// Parse the stdout of `sbx ls --json` into the `sbxw-`-prefixed entries.
+///
+/// `sbx` may emit daemon-startup lines before the JSON and other output after
+/// it, so this starts at the first '{' and parses only the first JSON value,
+/// ignoring anything that follows.
+fn parse_sbx_list(text: &str) -> Result<Vec<SbxEntry>> {
     let json = match text.find('{') {
         Some(i) => &text[i..],
         None => return Ok(Vec::new()),
     };
-    let list: SbxList = serde_json::from_str(json).context("failed to parse `sbx ls --json`")?;
+    let list: SbxList = serde_json::Deserializer::from_str(json)
+        .into_iter::<SbxList>()
+        .next()
+        .context("`sbx ls --json` produced no JSON")?
+        .context("failed to parse `sbx ls --json`")?;
     Ok(list
         .sandboxes
         .into_iter()
@@ -254,8 +269,7 @@ fn scoped_sandboxes(root: &Path) -> Result<Vec<SbxEntry>> {
     Ok(list_sandboxes()?
         .into_iter()
         .filter(|s| {
-            name_from_sandbox(&s.name)
-                .is_some_and(|name| sandbox_belongs_to_repo(root, name, s))
+            name_from_sandbox(&s.name).is_some_and(|name| sandbox_belongs_to_repo(root, name, s))
         })
         .collect())
 }
@@ -604,6 +618,62 @@ mod tests {
         assert!(workspace_matches(&root, "foo", wt.to_str().unwrap()));
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    const SBX_LS_JSON: &str = r#"{
+  "sandboxes": [
+    {
+      "name": "sbxw-foo",
+      "status": "running",
+      "workspaces": ["/repo/.sbxw/worktrees/foo"]
+    },
+    {
+      "name": "not-managed-by-sbxw",
+      "status": "stopped",
+      "workspaces": ["/elsewhere"]
+    }
+  ]
+}"#;
+
+    fn names(entries: &[SbxEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn parses_sbx_ls_and_keeps_only_sbxw_sandboxes() {
+        let entries = parse_sbx_list(SBX_LS_JSON).unwrap();
+
+        assert_eq!(names(&entries), ["sbxw-foo"]);
+        assert_eq!(entries[0].status, "running");
+        assert_eq!(entries[0].workspaces, ["/repo/.sbxw/worktrees/foo"]);
+    }
+
+    #[test]
+    fn skips_leading_output_before_the_json() {
+        let text = format!("Starting sandbox daemon...\n{SBX_LS_JSON}");
+
+        assert_eq!(names(&parse_sbx_list(&text).unwrap()), ["sbxw-foo"]);
+    }
+
+    #[test]
+    fn ignores_trailing_output_after_the_json() {
+        // Regression: after a sandbox has been launched and exited, `sbx`
+        // can print more output after the JSON, which used to fail with
+        // "trailing characters".
+        let text = format!("{SBX_LS_JSON}\nSome trailing notice from sbx\n");
+
+        assert_eq!(names(&parse_sbx_list(&text).unwrap()), ["sbxw-foo"]);
+    }
+
+    #[test]
+    fn no_json_means_no_sandboxes() {
+        assert!(parse_sbx_list("").unwrap().is_empty());
+        assert!(parse_sbx_list("No sandboxes found.\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_json_is_still_an_error() {
+        assert!(parse_sbx_list(r#"{"sandboxes": [ {"name": "#).is_err());
     }
 
     #[test]
